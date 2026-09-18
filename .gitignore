@@ -1,0 +1,13 @@
+# Credential captures and extracted creds (sensitive)
+creds/
+
+# Runtime output
+logs/
+serve/
+
+# Generated CA private key — never commit
+ca/
+
+# Stray captures
+*.pcap
+*.pcapng
