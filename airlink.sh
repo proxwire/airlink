@@ -51,6 +51,7 @@ HOSTAPD_CONF=""
 CLEANED_UP=0
 DNSMASQ_CONF="/etc/dnsmasq.d/custom-dhcp.conf"
 ORIG_IP_FORWARD=""
+ORIG_DNSMASQ_ACTIVE=""
 # Interfaces we took away from NetworkManager / changed the type of, so cleanup
 # can hand them back exactly as they were.
 NM_RELEASED=()
@@ -153,6 +154,12 @@ restore_interface() {
 # link. Deliberately broad — note it also stops a libvirt/LXD dnsmasq if one
 # is running on this host.
 clear_competing_dhcp() {
+    # Remember whether the host's own dnsmasq unit was running before we touch
+    # it, so cleanup can put it back exactly as it was (some hosts use dnsmasq
+    # as their system resolver — stopping it for good would break their DNS).
+    if [[ -z "$ORIG_DNSMASQ_ACTIVE" ]]; then
+        systemctl is-active --quiet dnsmasq && ORIG_DNSMASQ_ACTIVE=1 || ORIG_DNSMASQ_ACTIVE=0
+    fi
     systemctl stop dnsmasq 2>/dev/null
     pkill -f dhclient 2>/dev/null
     pkill -f dnsmasq 2>/dev/null
@@ -197,9 +204,16 @@ cleanup() {
     fi
     rm -f "$DNSMASQ_CONF"
     [[ -n "$RUN_TMPDIR" ]] && rm -rf "$RUN_TMPDIR"
-    # Stop only the unit this script started; no broad pkill, which would take
+    # Restore dnsmasq to the state it was in before we ran. Our config is now
+    # removed, so if the host was running dnsmasq as its own resolver, a restart
+    # brings it back with only the system config (host DNS restored); if it was
+    # not running before, leave it stopped. No broad pkill — that would take
     # down an unrelated libvirt/LXD dnsmasq along with it.
-    systemctl stop dnsmasq 2>/dev/null
+    if [[ "$ORIG_DNSMASQ_ACTIVE" == "1" ]]; then
+        systemctl restart dnsmasq 2>/dev/null
+    else
+        systemctl stop dnsmasq 2>/dev/null
+    fi
     pl_msg "cleanup complete."
 }
 
@@ -828,11 +842,20 @@ make_output_dir "$LOGS_DIR"
 pl_msg "dhcp range: $NETWORK_PREFIX.3-$NETWORK_PREFIX.200 on $INTERFACE"
 {
     echo "interface=$INTERFACE"
+    # bind-interfaces alone is not enough: dnsmasq auto-adds loopback to its
+    # listen set whenever "interface=" is used, so it still binds 127.0.0.1:53
+    # and answers the host's own queries there. With the "-D" wildcard spoof
+    # below that redirects every lookup to $INITIAL_STATIC_IP, that breaks the
+    # host's DNS. except-interface=lo keeps dnsmasq off loopback; together these
+    # confine it to $INTERFACE (the client side), never the host.
     echo "bind-interfaces"
+    echo "except-interface=lo"
     echo "dhcp-range=$DHCP_RANGE"
     echo "dhcp-script=$DHCP_HOOK"
     echo "log-queries"
     echo "log-facility=$LOGS_DIR/dns.log"
+    # Now safe: with the binding confined above, this only spoofs queries that
+    # arrive on $INTERFACE (the connected clients), not the host.
     [[ $DNS_SPOOF -eq 1 ]] && echo "address=/#/$INITIAL_STATIC_IP"
 } > "$DNSMASQ_CONF"
 
